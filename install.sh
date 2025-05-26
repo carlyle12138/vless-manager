@@ -400,7 +400,7 @@ http {
   }
 }
 EOF
-  systemctl force-reload nginx
+  systemctl restart nginx
 }
 
 rebuild_singbox() {
