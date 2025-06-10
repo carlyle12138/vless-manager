@@ -331,8 +331,8 @@ write_nginx() {
     while read -r _; do
       idx=$((idx + 1))
       srv+="  server {\n"
-      srv+="    listen $((4443 + idx - 1)) reuseport;\n"
-      srv+="    listen [::]:$((4443 + idx - 1)) reuseport;\n"
+      srv+="    listen $((14443 + idx - 1)) reuseport;\n"
+      srv+="    listen [::]:$((14443 + idx - 1)) reuseport;\n"
       srv+="    proxy_pass singbox_ld${idx};\n"
       srv+="    ssl_preread on;\n"
       srv+="  }\n\n"
@@ -544,7 +544,7 @@ publish_sub() {
       usr=$(jq -r '.username // empty' <<<"$row")
       pwd=$(jq -r '.password // empty' <<<"$row")
       loc=$(geo_by_proxy "$typ" "$svr" "$prt" "$usr" "$pwd")
-      ext=$((4443 + idx - 1))
+      ext=$((14443 + idx - 1))
       echo "vless://${CORE_UUID}@${PUBLIC_IP}:${ext}?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=chrome&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${loc}-${tag}" >>"$tmp"
     done < <(jq -c '.[]' "$LANDINGS_JSON")
   fi
