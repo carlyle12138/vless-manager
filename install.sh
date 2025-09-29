@@ -26,13 +26,15 @@ CORE_PRIV=""
 CORE_PUB=""
 SHORT_ID=""
 PUBLIC_IP=""
-LOCATION_TAG="其他"
+LOCATION_TAG="Other"
 
 CF_Token=""
 CF_Zone_ID=""
 ACME_EMAIL=""
 
 # 辅助输出
+ENDPOINT_TYPES=("wireguard")
+
 info() {
   echo -e "\e[36m[INFO]\e[0m $*"
 }
@@ -143,7 +145,7 @@ install_acme() {
   set +u
   curl https://get.acme.sh | sh -s email="$ACME_EMAIL"
   set -u
-  
+
   . ~/.acme.sh/acme.sh.env
 }
 
@@ -179,53 +181,29 @@ delete_dns_if_any() {
 
 # 地理信息相关
 fetch_geo() {
-  if [[ -z $PUBLIC_IP ]]; then
-    local geo
-    geo=$(curl -4s ping0.cc/geo || true)
-    PUBLIC_IP=$(sed -n '1p' <<<"$geo")
-    local loc
-    loc=$(sed -n '2p' <<<"$geo")
-    case $loc in
-      *香港*) LOCATION_TAG="香港" ;;
-      *台湾*) LOCATION_TAG="台湾" ;;
-      *日本*) LOCATION_TAG="日本" ;;
-      *新加坡*) LOCATION_TAG="新加坡" ;;
-      *美国*) LOCATION_TAG="美国" ;;
-      *) LOCATION_TAG="其他" ;;
-    esac
-  fi
-}
-geo_by_proxy() {
-  # 参数：$1=type(socks/http)，$2=server，$3=port，$4=user，$5=pass
-  local pf ip_resp l2 try
-  if [[ $1 == socks* ]]; then
-    pf="socks5h://"
-    [[ -n ${4:-} ]] && pf+="$4:$5@"
-    pf+="$2:$3"
-  else
-    pf="http://"
-    [[ -n ${4:-} ]] && pf+="$4:$5@"
-    pf+="$2:$3"
-  fi
-  for try in {1..3}; do
-    local g
-    g=$(curl -4s --max-time 6 --proxy "$pf" ping0.cc/geo 2>/dev/null || true)
-    [[ -z $g ]] && break
-    ip_resp=$(sed -n '1p' <<<"$g")
-    if [[ $ip_resp == "$2" ]]; then
-      l2=$(sed -n '2p' <<<"$g")
-      case $l2 in
-        *香港*) echo 香港 ;;
-        *台湾*) echo 台湾 ;;
-        *日本*) echo 日本 ;;
-        *新加坡*) echo 新加坡 ;;
-        *美国*) echo 美国 ;;
-        *) echo 落地 ;;
-      esac
-      return
+  local q g status cc ip
+  q="${1:-}"
+  if [[ -n $q ]]; then
+    g=$(curl -4s --max-time 6 "http://ip-api.com/line/${q}?fields=26650" || true)
+    status=$(sed -n '1p' <<<"$g")
+    if [[ $status == "success" ]]; then
+      cc=$(sed -n '2p' <<<"$g")
+      if [[ -n $cc ]]; then
+        echo "$cc"
+        return
+      fi
     fi
-  done
-  echo 落地
+    echo Other
+    return
+  fi
+  g=$(curl -4s --max-time 6 "http://ip-api.com/line?fields=26650" || true)
+  status=$(sed -n '1p' <<<"$g")
+  if [[ $status == "success" ]]; then
+    cc=$(sed -n '2p' <<<"$g")
+    ip=$(sed -n '6p' <<<"$g")
+    [[ -n $cc ]] && LOCATION_TAG="$cc"
+    [[ -n $ip ]] && PUBLIC_IP="$ip"
+  fi
 }
 
 # 证书相关
@@ -299,19 +277,28 @@ renew_token() {
   echo "$token" > "$SUB_TOKEN_FILE"
   rm -f "$SUB_DIR/$old"
 }
+ensure_landings_uuid() {
+  if [[ -f $LANDINGS_JSON && $(jq length "$LANDINGS_JSON") -gt 0 ]]; then
+    local idx=0
+    while read -r row; do
+      idx=$((idx + 1))
+      local lu
+      lu=$(jq -r '.uuid // empty' <<<"$row")
+      if [[ -z $lu || $lu == "null" ]]; then
+        local nu
+        nu=$(uuidgen)
+        jq --indent 2 --argjson i "$((idx - 1))" --arg u "$nu" \
+          '.[$i].uuid = $u' "$LANDINGS_JSON" > tmp && mv tmp "$LANDINGS_JSON"
+      fi
+    done < <(jq -c '.[]' "$LANDINGS_JSON")
+  fi
+}
 
 # 配置生成
 write_nginx() {
-  local ups srv idx=0
+  local ups srv
   ups="  upstream singbox_direct {\n    server 127.0.0.1:30000;\n  }\n"
   ups+="  upstream web_backend {\n    server 127.0.0.1:8443;\n  }\n"
-
-  if [[ -f $LANDINGS_JSON && $(jq length "$LANDINGS_JSON") -gt 0 ]]; then
-    while read -r _; do
-      idx=$((idx + 1))
-      ups+="  upstream singbox_ld${idx} {\n    server 127.0.0.1:$((30000 + idx));\n  }\n"
-    done < <(jq -c '.[]' "$LANDINGS_JSON")
-  fi
 
   srv="  map \$ssl_preread_server_name \$backend {\n"
   srv+="    $SERVER_DOMAIN  singbox_direct;\n"
@@ -325,19 +312,6 @@ write_nginx() {
   srv+="    proxy_timeout 300s;\n"
   srv+="    proxy_connect_timeout 10s;\n"
   srv+="  }\n\n"
-
-  idx=0
-  if [[ -f $LANDINGS_JSON && $(jq length "$LANDINGS_JSON") -gt 0 ]]; then
-    while read -r _; do
-      idx=$((idx + 1))
-      srv+="  server {\n"
-      srv+="    listen $((14443 + idx - 1)) reuseport;\n"
-      srv+="    listen [::]:$((14443 + idx - 1)) reuseport;\n"
-      srv+="    proxy_pass singbox_ld${idx};\n"
-      srv+="    ssl_preread on;\n"
-      srv+="  }\n\n"
-    done < <(jq -c '.[]' "$LANDINGS_JSON")
-  fi
 
   cat >"$NGINX_CONF" <<EOF
 user nginx;
@@ -404,20 +378,43 @@ EOF
 }
 
 rebuild_singbox() {
-  local inbounds outbounds routes inbound ob rt idx=0
+  local inbounds outbounds routes inbound ob rt
+  ensure_domain
+  ensure_core_vars
+  ensure_landings_uuid
 
-  inbounds=$(jq -n \
+  local users u
+  users=$(jq -n \
+    --arg name "direct" \
     --arg uuid "$CORE_UUID" \
+    '[{"name":$name,"uuid":$uuid,"flow":"xtls-rprx-vision"}]')
+
+  if [[ -f $LANDINGS_JSON && $(jq length "$LANDINGS_JSON") -gt 0 ]]; then
+    while read -r row; do
+      local tag l_uuid
+      tag=$(jq -r .tag <<<"$row")
+      l_uuid=$(jq -r '.uuid // empty' <<<"$row")
+      if [[ -z $l_uuid || $l_uuid == "null" ]]; then
+        l_uuid=$(uuidgen)
+        jq --indent 2 --arg t "$tag" --arg u "$l_uuid" '(.[] | select(.tag==$t)).uuid=$u' "$LANDINGS_JSON" > tmp && mv tmp "$LANDINGS_JSON"
+      fi
+      u=$(jq -n --arg name "$tag" --arg uuid "$l_uuid" '{"name":$name,"uuid":$uuid,"flow":"xtls-rprx-vision"}')
+      users=$(jq -n --argjson a "$users" --argjson b "$u" '$a + [$b]')
+    done < <(jq -c '.[]' "$LANDINGS_JSON")
+  fi
+
+  inbound=$(jq -n \
     --arg sn "$SERVER_DOMAIN" \
     --arg pk "$CORE_PRIV" \
     --arg sid "$SHORT_ID" \
-    --argjson port 30000 '
-    [{
+    --argjson port 30000 \
+    --argjson users "$users" '
+    {
       "type":"vless",
       "tag":"vless-direct",
       "listen":"127.0.0.1",
       "listen_port":$port,
-      "users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],
+      "users": $users,
       "tls":{
         "enabled":true,
         "server_name":$sn,
@@ -428,85 +425,35 @@ rebuild_singbox() {
           "short_id":[$sid]
         }
       }
-    }]
+    }
   ')
+  inbounds=$(jq -n --argjson b "$inbound" '[ $b ]')
   outbounds=$(jq -n '[{"type":"direct","tag":"direct"}]')
-  routes=$(jq -n '[{"inbound":["vless-direct"],"outbound":"direct"}]')
+  endpoints=$(jq -n '[]')
+  routes=$(jq -n '[{"auth_user":"direct","outbound":"direct"}]')
 
   if [[ -f $LANDINGS_JSON && $(jq length "$LANDINGS_JSON") -gt 0 ]]; then
     while read -r row; do
-      idx=$((idx + 1))
-      local tag typ svr prt usr pwd loc_port
+      local tag out_tag
       tag=$(jq -r .tag <<<"$row")
-      typ=$(jq -r .type <<<"$row")
-      svr=$(jq -r .server <<<"$row")
-      prt=$(jq -r .port <<<"$row")
-      usr=$(jq -r '.username // empty' <<<"$row")
-      pwd=$(jq -r '.password // empty' <<<"$row")
-      loc_port=$((30000 + idx))
-
-      inbound=$(jq -n \
-        --arg tag "$tag" \
-        --arg uuid "$CORE_UUID" \
-        --arg sn "$SERVER_DOMAIN" \
-        --arg pk "$CORE_PRIV" \
-        --arg sid "$SHORT_ID" \
-        --argjson lp "$loc_port" '
-        {
-          "type":"vless",
-          "tag":("vless-" + $tag),
-          "listen":"127.0.0.1",
-          "listen_port":$lp,
-          "users":[{"uuid":$uuid,"flow":"xtls-rprx-vision"}],
-          "tls":{
-            "enabled":true,
-            "server_name":$sn,
-            "reality":{
-              "enabled":true,
-              "handshake":{"server":"127.0.0.1","server_port":8443},
-              "private_key":$pk,
-              "short_id":[$sid]
-            }
-          }
-        }
-      ')
-      inbounds=$(jq -n --argjson a "$inbounds" --argjson b "$inbound" '$a + [$b]')
-      case $typ in
-        socks)
-          ob=$(jq -n \
-            --arg tag "$tag" \
-            --arg svr "$svr" \
-            --argjson p "$prt" \
-            --arg u "$usr" \
-            --arg w "$pwd" '
-            {
-              "type": "socks",
-              "tag": $tag,
-              "server": $svr,
-              "server_port": $p,
-              "version": "5",
-              "username": $u,
-              "password": $w
-            }')
-        ;;
-        http)
-          ob=$(jq -n \
-            --arg tag "$tag" \
-            --arg svr "$svr" \
-            --argjson p "$prt" '
-            {
-              "type":"http",
-              "tag":$tag,
-              "server":$svr,
-              "server_port":$p
-            }')
-        ;;
-        direct)
-          ob=""
-        ;;
-      esac
-      [[ -n $ob ]] && outbounds=$(jq -n --argjson a "$outbounds" --argjson b "$ob" '$a + [$b]')
-      rt=$(jq -n --arg tag "$tag" '{ "inbound":["vless-"+$tag],"outbound":$tag }')
+      if jq -e 'has("endpoint")' <<<"$row" >/dev/null; then
+        ep=$(jq -c '.endpoint' <<<"$row")
+        endpoints=$(jq -n --argjson a "$endpoints" --argjson b "$ep" '$a + [$b]')
+        out_tag=$(jq -r '.endpoint.tag // empty' <<<"$row")
+        if [[ -z $out_tag ]]; then
+          die "落地配置缺少 endpoint.tag: $row"
+        fi
+      else
+        ob=$(jq -c '.outbound' <<<"$row")
+        out_tag=$(jq -r '.outbound.tag // empty' <<<"$row")
+        if [[ -z $out_tag ]]; then
+          die "落地配置缺少 outbound.tag: $row"
+        fi
+        if [[ $out_tag != "direct" ]]; then
+          [[ -n $ob && $ob != "null" ]] && outbounds=$(jq -n --argjson a "$outbounds" --argjson b "$ob" '$a + [$b]')
+        fi
+      fi
+      rt=$(jq -n --arg tag "$tag" --arg out "$out_tag" '{ "auth_user": $tag , "outbound": $out }')
       routes=$(jq -n --argjson r "$routes" --argjson x "$rt" '$r + [$x]')
     done < <(jq -c '.[]' "$LANDINGS_JSON")
   fi
@@ -514,8 +461,9 @@ rebuild_singbox() {
   jq -n \
     --argjson ib "$inbounds" \
     --argjson ob "$outbounds" \
+    --argjson ep "$endpoints" \
     --argjson rt "$routes" \
-    '{ "inbounds": $ib, "outbounds": $ob, "route": { "rules": $rt } }' \
+    '{ "inbounds": $ib, "outbounds": $ob, "endpoints": $ep, "route": { "rules": $rt } }' \
     --indent 2 >"$CONF_JSON"
   systemctl restart sing-box
 }
@@ -526,26 +474,32 @@ publish_sub() {
   ensure_domain
   ensure_core_vars
   ensure_token
+  ensure_landings_uuid
   fetch_geo
 
   local tmp
   tmp=$(mktemp)
-  echo "vless://${CORE_UUID}@${PUBLIC_IP}:443?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=chrome&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${LOCATION_TAG}-direct" >>"$tmp"
+  local dlabel denc
+  dlabel="${LOCATION_TAG}-direct"
+  denc=$(printf '%s' "$dlabel" | jq -sRr @uri)
+  echo "vless://${CORE_UUID}@${PUBLIC_IP}:443?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=chrome&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${denc}" >>"$tmp"
 
   if [[ -f $LANDINGS_JSON && $(jq length "$LANDINGS_JSON") -gt 0 ]]; then
-    local idx=0
     while read -r row; do
-      idx=$((idx + 1))
-      local tag typ svr prt usr pwd loc ext
+      local tag loc lu q
       tag=$(jq -r .tag <<<"$row")
-      typ=$(jq -r .type <<<"$row")
-      svr=$(jq -r .server <<<"$row")
-      prt=$(jq -r .port <<<"$row")
-      usr=$(jq -r '.username // empty' <<<"$row")
-      pwd=$(jq -r '.password // empty' <<<"$row")
-      loc=$(geo_by_proxy "$typ" "$svr" "$prt" "$usr" "$pwd")
-      ext=$((14443 + idx - 1))
-      echo "vless://${CORE_UUID}@${PUBLIC_IP}:${ext}?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=chrome&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${loc}-${tag}" >>"$tmp"
+      lu=$(jq -r '.uuid // empty' <<<"$row")
+      q=$(jq -r '.outbound.server // .endpoint.peers[0].address // empty' <<<"$row")
+      if [[ -n $q ]]; then
+        loc=$(fetch_geo "$q")
+      else
+        loc="Other"
+      fi
+      [[ -n $lu ]] || lu="$CORE_UUID"
+      local label enc
+      label="${loc}-${tag}"
+      enc=$(printf '%s' "$label" | jq -sRr @uri)
+      echo "vless://${lu}@${PUBLIC_IP}:443?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=chrome&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${enc}" >>"$tmp"
     done < <(jq -c '.[]' "$LANDINGS_JSON")
   fi
 
@@ -568,39 +522,67 @@ edit_landings() {
 
   case $act in
     1)
-      read -rp "请输入节点标识 tag(英文): " tag
-      echo "1) socks"
-      echo "2) http"
-      echo "3) direct"
-      read -rp "请选择类型: " tnum
-      local typ
-      case $tnum in
-        1) typ="socks" ;;
-        2) typ="http" ;;
-        3) typ="direct" ;;
-        *) warn "无效选择"; return ;;
-      esac
-      read -rp "请输入服务器地址: " svr
-      read -rp "请输入服务器端口: " prt
-      if [[ $typ == "socks" ]]; then
-        read -rp "用户名(可空): " usr
-        read -rp "密码(可空): " pwd
+      echo "请粘贴 JSON；粘贴完直接回车即可（空行确认）。若未识别为有效 JSON，请继续粘贴直至空行确认。"
+      j=""
+      while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+          tmp=${j%$'\n'}
+          if [[ -n "$tmp" ]] && echo "$tmp" | jq -e . >/dev/null 2>&1; then
+            j="$tmp"
+            break
+          fi
+        fi
+        j+="$line"$'\n'
+      done
+      j=${j//$'\r'/}
+      if ! echo "$j" | jq -e . >/dev/null 2>&1; then
+        warn "JSON 无效"
+        return
+      fi
+      local o_tag o_type is_ep
+      o_tag=$(echo "$j" | jq -r '.tag // empty')
+      if [[ -z $o_tag ]]; then
+        warn "JSON 中缺少 tag"
+        return
+      fi
+      o_type=$(echo "$j" | jq -r '.type // empty')
+      is_ep=0; for _t in "${ENDPOINT_TYPES[@]}"; do [[ "$o_type" == "$_t" ]] && { is_ep=1; break; }; done
+      if [[ "$o_tag" == "direct" ]]; then
+        warn "tag 不可为保留值 direct"
+        return
+      fi
+      if jq -e --arg t "$o_tag" 'map(select((.outbound?.tag // "") == $t or (.endpoint?.tag // "") == $t)) | length > 0' "$LANDINGS_JSON" >/dev/null; then
+        warn "tag 已存在"
+        return
+      fi
+      local tmpc
+      tmpc=$(mktemp)
+      if [[ $is_ep -eq 1 ]]; then
+        jq -n --argjson o "$j" '{endpoints: [$o]}' >"$tmpc"
+      else
+        jq -n --argjson o "$j" '{outbounds: [$o]}' >"$tmpc"
+      fi
+      if ! sing-box check -c "$tmpc" >/dev/null 2>&1; then
+        rm -f "$tmpc"
+        warn "sing-box check 未通过"
+        return
+      fi
+      rm -f "$tmpc"
+      local nu
+      nu=$(uuidgen)
+      if [[ $is_ep -eq 1 ]]; then
         jq --indent 2 \
-          --arg t "$tag" \
-          --arg ty "$typ" \
-          --arg s "$svr" \
-          --argjson p "$prt" \
-          --arg u "$usr" \
-          --arg w "$pwd" \
-          '. += [{"tag":$t,"type":$ty,"server":$s,"port":$p,"username":$u,"password":$w}]' \
+          --arg t "$o_tag" \
+          --arg g "$nu" \
+          --argjson o "$j" \
+          '. += [{"tag":$t,"uuid":$g,"endpoint":$o}]' \
           "$LANDINGS_JSON" >tmp && mv tmp "$LANDINGS_JSON"
       else
         jq --indent 2 \
-          --arg t "$tag" \
-          --arg ty "$typ" \
-          --arg s "$svr" \
-          --argjson p "$prt" \
-          '. += [{"tag":$t,"type":$ty,"server":$s,"port":$p}]' \
+          --arg t "$o_tag" \
+          --arg g "$nu" \
+          --argjson o "$j" \
+          '. += [{"tag":$t,"uuid":$g,"outbound":$o}]' \
           "$LANDINGS_JSON" >tmp && mv tmp "$LANDINGS_JSON"
       fi
     ;;
@@ -615,34 +597,75 @@ edit_landings() {
       jq -r 'to_entries[] | "\(.key+1)) \(.value.tag)"' "$LANDINGS_JSON"
       read -rp "请输入要修改的序号: " idx
       idx=$((idx-1))
-      local cur_tag cur_srv cur_prt cur_usr cur_pwd
+      local cur_tag
       cur_tag=$(jq -r ".[$idx].tag" "$LANDINGS_JSON" 2>/dev/null) || die "序号无效"
-      cur_srv=$(jq -r ".[$idx].server" "$LANDINGS_JSON")
-      cur_prt=$(jq -r ".[$idx].port" "$LANDINGS_JSON")
-      cur_usr=$(jq -r ".[$idx].username // \"\"" "$LANDINGS_JSON")
-      cur_pwd=$(jq -r ".[$idx].password // \"\"" "$LANDINGS_JSON")
-
       echo "当前 tag=$cur_tag:"
-      read -rp "新服务器 [$cur_srv]: " ns
-      read -rp "新端口   [$cur_prt]: " np
-      read -rp "新用户名 [$cur_usr]: " nu
-      read -rp "新密码   [$cur_pwd]: " nw
-      ns=${ns:-$cur_srv}
-      np=${np:-$cur_prt}
-      nu=${nu:-$cur_usr}
-      nw=${nw:-$cur_pwd}
+      echo "请粘贴新的 JSON；粘贴完直接回车即可（空行确认）。若未识别为有效 JSON，请继续粘贴，直至空行确认生效。"
+      j2=""
+      while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+          tmp2=${j2%$'\n'}
+          if [[ -n "$tmp2" ]] && echo "$tmp2" | jq -e . >/dev/null 2>&1; then
+            j2="$tmp2"
+            break
+          fi
+        fi
+        j2+="$line"$'\n'
+      done
+      j2=${j2//$'\r'/}
+      if ! echo "$j2" | jq -e . >/dev/null 2>&1; then
+        warn "JSON 无效"
+        return
+      fi
+      local o2_tag o2_type is_ep2 tmpc2
+      o2_tag=$(echo "$j2" | jq -r '.tag // empty')
+      if [[ -z $o2_tag ]]; then
+        warn "JSON 中缺少 tag"
+        return
+      fi
+      # 重复 tag 校验（排除自身），覆盖 endpoints/outbounds
+      if [[ "$o2_tag" == "direct" ]]; then
+        warn "tag 不可为保留值 direct"
+        return
+      fi
+      if jq -e --arg t "$o2_tag" --argjson i "$idx" 'to_entries | map(select(.key != $i) | select((.value.outbound?.tag // "") == $t or (.value.endpoint?.tag // "") == $t)) | length > 0' "$LANDINGS_JSON" >/dev/null; then
+        warn "tag 已存在"
+        return
+      fi
+      o2_type=$(echo "$j2" | jq -r '.type // empty')
+      is_ep2=0; for _t in "${ENDPOINT_TYPES[@]}"; do [[ "$o2_type" == "$_t" ]] && { is_ep2=1; break; }; done
+      tmpc2=$(mktemp)
+      if [[ $is_ep2 -eq 1 ]]; then
+        jq -n --argjson o "$j2" '{endpoints: [$o]}' >"$tmpc2"
+      else
+        jq -n --argjson o "$j2" '{outbounds: [$o]}' >"$tmpc2"
+      fi
+      if ! sing-box check -c "$tmpc2" >/dev/null 2>&1; then
+        rm -f "$tmpc2"
+        warn "sing-box check 未通过"
+        return
+      fi
+      rm -f "$tmpc2"
+      if [[ $is_ep2 -eq 1 ]]; then
 
-      jq --indent 2 \
-        --argjson i "$idx" \
-        --arg ns "$ns" \
-        --argjson np "$np" \
-        --arg nu "$nu" \
-        --arg nw "$nw" '
-        .[$i].server   = $ns |
-        .[$i].port     = $np |
-        .[$i].username = ($nu | select(. != "")) |
-        .[$i].password = ($nw | select(. != ""))
-      ' "$LANDINGS_JSON" > tmp && mv tmp "$LANDINGS_JSON"
+        jq --indent 2 \
+          --argjson i "$idx" \
+          --argjson o "$j2" \
+          --arg t "$o2_tag" '
+          .[$i].endpoint = $o |
+          .[$i].tag = $t |
+          del(.[$i].outbound)
+        ' "$LANDINGS_JSON" > tmp && mv tmp "$LANDINGS_JSON"
+      else
+        jq --indent 2 \
+          --argjson i "$idx" \
+          --argjson o "$j2" \
+          --arg t "$o2_tag" '
+          .[$i].outbound = $o |
+          .[$i].tag = $t |
+          del(.[$i].endpoint)
+        ' "$LANDINGS_JSON" > tmp && mv tmp "$LANDINGS_JSON"
+      fi
     ;;
     3)
       local total_del
@@ -663,6 +686,7 @@ edit_landings() {
 
   ensure_domain
   ensure_core_vars
+  ensure_landings_uuid
   write_nginx
   rebuild_singbox
   publish_sub
@@ -723,6 +747,92 @@ show_sub() {
   info "订阅链接：https://${SERVER_DOMAIN}/subscribe/${token}"
 }
 
+generate_wg_config() {
+  local l_idx d_idx d_ip host_oct
+  read -rp "请输入线路机编号: " l_idx
+  read -rp "请输入落地机编号: " d_idx
+  read -rp "请输入落地机 IP: " d_ip
+
+  [[ ${l_idx:-} =~ ^[0-9]+$ ]] || { warn "线路机编号无效"; return; }
+  [[ ${d_idx:-} =~ ^[0-9]+$ ]] || { warn "落地机编号无效"; return; }
+  host_oct=$((100 + l_idx))
+
+  if ! command -v sing-box >/dev/null 2>&1; then
+    warn "未找到 sing-box，请先安装后再试"
+    return
+  fi
+
+  # 生成密钥对
+  local o1 o2 line_priv line_pub land_priv land_pub
+  if ! o1=$(sing-box generate wg-keypair 2>/dev/null); then warn "生成线路机密钥失败"; return; fi
+  line_priv=$(awk -F': ' '/^PrivateKey: /{print $2}' <<<"$o1")
+  line_pub=$(awk -F': ' '/^PublicKey: /{print $2}' <<<"$o1")
+  if [[ -z $line_priv || -z $line_pub ]]; then warn "解析线路机密钥失败"; return; fi
+
+  if ! o2=$(sing-box generate wg-keypair 2>/dev/null); then warn "生成落地机密钥失败"; return; fi
+  land_priv=$(awk -F': ' '/^PrivateKey: /{print $2}' <<<"$o2")
+  land_pub=$(awk -F': ' '/^PublicKey: /{print $2}' <<<"$o2")
+  if [[ -z $land_priv || -z $land_pub ]]; then warn "解析落地机密钥失败"; return; fi
+
+  local line_addr land_addr land_allowed
+  line_addr="10.66.${d_idx}.${host_oct}/24"
+  land_addr="10.66.${d_idx}.1/24"
+  land_allowed="10.66.${d_idx}.${host_oct}/32"
+
+  # 构造 JSON
+  local json_line json_land
+  json_line=$(jq -n \
+    --arg tag "wg-ep${d_idx}" \
+    --arg name "wg${d_idx}" \
+    --arg addr "$line_addr" \
+    --arg priv "$line_priv" \
+    --arg peer_addr "$d_ip" \
+    --arg peer_pub "$land_pub" \
+    '{
+      type: "wireguard",
+      tag: $tag,
+      system: true,
+      name: $name,
+      mtu: 1408,
+      address: [$addr],
+      private_key: $priv,
+      peers: [{
+        address: $peer_addr,
+        port: 51820,
+        public_key: $peer_pub,
+        allowed_ips: ["0.0.0.0/0", "::/0"],
+        persistent_keepalive_interval: 25
+      }]
+    }')
+
+  json_land=$(jq -n \
+    --arg addr "$land_addr" \
+    --arg priv "$land_priv" \
+    --arg lpub "$line_pub" \
+    --arg allowed "$land_allowed" \
+    '{
+      type: "wireguard",
+      tag: "wg-ep",
+      system: true,
+      name: "wg0",
+      mtu: 1408,
+      address: [$addr],
+      private_key: $priv,
+      listen_port: 51820,
+      peers: [{
+        public_key: $lpub,
+        allowed_ips: [$allowed]
+      }]
+    }')
+
+  echo
+  echo "线路机："
+  echo "$json_line"
+  echo
+  echo "落地机："
+  echo "$json_land"
+}
+
 # 主菜单
 while :; do
   echo
@@ -733,6 +843,7 @@ while :; do
   echo "4) 更新落地 (增加/修改/删除)"
   echo "5) 查看订阅链接"
   echo "6) 刷新订阅 (仅更新 Token)"
+  echo "7) 生成 WG 配置（仅输出，两端 JSON）"
   echo "0) 退出"
   read -rp "请选择: " sel
   case $sel in
@@ -742,6 +853,7 @@ while :; do
     4) edit_landings ;;
     5) show_sub ;;
     6) renew_token; publish_sub ;;
+    7) generate_wg_config ;;
     0) exit 0 ;;
     *) warn "无效选择" ;;
   esac
