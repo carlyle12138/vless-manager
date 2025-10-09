@@ -181,13 +181,12 @@ delete_dns_if_any() {
 
 # 地理信息相关
 fetch_geo() {
-  local q g status cc ip
+  local q g cc ip
   q="${1:-}"
   if [[ -n $q ]]; then
-    g=$(curl -4s --max-time 6 "http://ip-api.com/line/${q}?fields=26650" || true)
-    status=$(sed -n '1p' <<<"$g")
-    if [[ $status == "success" ]]; then
-      cc=$(sed -n '2p' <<<"$g")
+    g=$(curl -4s --max-time 6 "https://api.ip2location.io/?ip=${q}" || true)
+    if [[ -n $g ]] && echo "$g" | jq -e . >/dev/null 2>&1; then
+      cc=$(echo "$g" | jq -r '.country_code // empty')
       if [[ -n $cc ]]; then
         echo "$cc"
         return
@@ -196,11 +195,10 @@ fetch_geo() {
     echo Other
     return
   fi
-  g=$(curl -4s --max-time 6 "http://ip-api.com/line?fields=26650" || true)
-  status=$(sed -n '1p' <<<"$g")
-  if [[ $status == "success" ]]; then
-    cc=$(sed -n '2p' <<<"$g")
-    ip=$(sed -n '6p' <<<"$g")
+  g=$(curl -4s --max-time 6 "https://api.ip2location.io/" || true)
+  if [[ -n $g ]] && echo "$g" | jq -e . >/dev/null 2>&1; then
+    cc=$(echo "$g" | jq -r '.country_code // empty')
+    ip=$(echo "$g" | jq -r '.ip // empty')
     [[ -n $cc ]] && LOCATION_TAG="$cc"
     [[ -n $ip ]] && PUBLIC_IP="$ip"
   fi
@@ -748,10 +746,11 @@ show_sub() {
 }
 
 generate_wg_config() {
-  local l_idx d_idx d_ip host_oct
+  local l_idx d_idx d_ip d_name host_oct
   read -rp "请输入线路机编号: " l_idx
   read -rp "请输入落地机编号: " d_idx
   read -rp "请输入落地机 IP: " d_ip
+  read -rp "请输入落地机服务器名称（可选，直接回车跳过）: " d_name
 
   [[ ${l_idx:-} =~ ^[0-9]+$ ]] || { warn "线路机编号无效"; return; }
   [[ ${d_idx:-} =~ ^[0-9]+$ ]] || { warn "落地机编号无效"; return; }
@@ -780,10 +779,17 @@ generate_wg_config() {
   land_allowed="10.66.${d_idx}.${host_oct}/32"
 
   # 构造 JSON
-  local json_line json_land
+  local line_tag line_name json_line json_land
+  if [[ -n $d_name ]]; then
+    line_tag="wg-ep${d_idx}-${d_name}"
+  else
+    line_tag="wg-ep${d_idx}"
+  fi
+  line_name="wg${d_idx}"
+
   json_line=$(jq -n \
-    --arg tag "wg-ep${d_idx}" \
-    --arg name "wg${d_idx}" \
+    --arg tag "$line_tag" \
+    --arg name "$line_name" \
     --arg addr "$line_addr" \
     --arg priv "$line_priv" \
     --arg peer_addr "$d_ip" \
@@ -805,7 +811,8 @@ generate_wg_config() {
       }]
     }')
 
-  json_land=$(jq -n \
+  local wg_ep
+  wg_ep=$(jq -n \
     --arg addr "$land_addr" \
     --arg priv "$land_priv" \
     --arg lpub "$line_pub" \
@@ -823,6 +830,19 @@ generate_wg_config() {
         public_key: $lpub,
         allowed_ips: [$allowed]
       }]
+    }')
+
+  json_land=$(jq -n \
+    --argjson ep "$wg_ep" \
+    '{
+      endpoints: [$ep],
+      outbounds: [{
+        type: "direct",
+        tag: "direct"
+      }],
+      route: {
+        final: "direct"
+      }
     }')
 
   echo
