@@ -480,7 +480,7 @@ publish_sub() {
   local dlabel denc
   dlabel="${LOCATION_TAG}-direct"
   denc=$(printf '%s' "$dlabel" | jq -sRr @uri)
-  echo "vless://${CORE_UUID}@${PUBLIC_IP}:443?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=chrome&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${denc}" >>"$tmp"
+  echo "vless://${CORE_UUID}@${PUBLIC_IP}:443?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=firefox&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${denc}" >>"$tmp"
 
   if [[ -f $LANDINGS_JSON && $(jq length "$LANDINGS_JSON") -gt 0 ]]; then
     while read -r row; do
@@ -497,7 +497,7 @@ publish_sub() {
       local label enc
       label="${loc}-${tag}"
       enc=$(printf '%s' "$label" | jq -sRr @uri)
-      echo "vless://${lu}@${PUBLIC_IP}:443?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=chrome&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${enc}" >>"$tmp"
+      echo "vless://${lu}@${PUBLIC_IP}:443?encryption=none&security=reality&type=tcp&sni=${SERVER_DOMAIN}&fp=firefox&pbk=${CORE_PUB}&sid=${SHORT_ID}&flow=xtls-rprx-vision#${enc}" >>"$tmp"
     done < <(jq -c '.[]' "$LANDINGS_JSON")
   fi
 
@@ -862,8 +862,9 @@ while :; do
   echo "3) 更新域名 (更换子域名)"
   echo "4) 更新落地 (增加/修改/删除)"
   echo "5) 查看订阅链接"
-  echo "6) 刷新订阅 (仅更新 Token)"
-  echo "7) 生成 WG 配置（仅输出，两端 JSON）"
+  echo "6) 刷新订阅Token"
+  echo "7) 更新订阅配置"
+  echo "8) 生成 WG 配置（仅输出，两端 JSON）"
   echo "0) 退出"
   read -rp "请选择: " sel
   case $sel in
@@ -873,7 +874,8 @@ while :; do
     4) edit_landings ;;
     5) show_sub ;;
     6) renew_token; publish_sub ;;
-    7) generate_wg_config ;;
+    7) publish_sub ;;
+    8) generate_wg_config ;;
     0) exit 0 ;;
     *) warn "无效选择" ;;
   esac
